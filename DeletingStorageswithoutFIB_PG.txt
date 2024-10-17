@@ -1,0 +1,133 @@
+BEGIN TRANSACTION;
+DO
+$$
+    BEGIN
+
+        DECLARE
+            _id UUID;
+            _storagename TEXT;
+            _backupname TEXT;
+            _start_date date;
+
+        BEGIN
+            _start_date:= TO_DATE('20240826', 'YYYYMMDD');
+
+            DROP TABLE IF EXISTS _toBackupCleanupAll;
+            CREATE TEMP TABLE _toBackupCleanupAll ON COMMIT DROP AS
+            SELECT DISTINCT bkp.id as backupId FROM "backup.model.storages" stg
+                                                        JOIN "backup.model.oibs" oib ON oib.storage_id = stg.id
+                                                        JOIN "backup.model.backups" bkp ON bkp.id = stg.backup_id
+            WHERE oib.is_corrupted = true AND
+                stg.data_size = 0 AND
+                bkp.job_target_type IN (51, 63) AND
+                stg.creation_time > _start_date;
+
+
+
+            DROP TABLE IF EXISTS _todeleteSuspects;
+            CREATE TEMP TABLE _toDeleteSuspects ON COMMIT DROP AS
+            WITH all_corrupted_oibs AS
+                     (
+                         select s.id as storage_id, o.id as oib_id, p.id as point_id, s.file_path as storagename, o.object_id as bobject_id, s.creation_time as storage_creation_time,
+                                o.is_corrupted as oib_is_corrupted, s.data_size as storage_data_size, s.backup_id as backup_id
+                         from "backup.model.storages" s
+                                  join "backup.model.oibs" o on s.id = o.storage_id
+                                  join "backup.model.points" p on p.id = o.point_id
+                                  join _toBackupCleanupAll cleanupall on cleanupall.backupId = p.backup_id
+                         where s.creation_time > _start_date
+                     ),
+                 sorted_one_oibs_per_object as
+                     (
+                         select all_corrupted_oibs.*,
+                                row_number() over (partition by all_corrupted_oibs.backup_id, all_corrupted_oibs.bobject_id order by storage_creation_time desc) as rowNumber
+                         from all_corrupted_oibs
+                     )
+            SELECT oib_id, storage_id, point_id, oib_is_corrupted, storage_data_size FROM sorted_one_oibs_per_object
+            WHERE rowNumber = 1;
+
+
+
+            DROP TABLE IF EXISTS _todelete;
+            CREATE TEMP TABLE _todelete ON COMMIT DROP AS
+            SELECT * FROM _toDeleteSuspects WHERE
+                storage_data_size = 0 AND oib_is_corrupted = true;
+
+
+
+            DROP TABLE IF EXISTS _storageforlog;
+            CREATE TEMP TABLE _storageforlog ON COMMIT DROP AS
+            select s.file_path as storage_path, b.job_name as backupname, s.id as storage_id from "backup.model.storages" s
+                                                                                             join "backup.model.backups" b on s.backup_id = b.id;
+
+            FOR _id IN SELECT oib_id FROM _todelete
+                LOOP
+                    RAISE NOTICE 'deleting oib %', _id;
+                    PERFORM "backup.model.deleteoib"(_id);
+                END LOOP;
+
+            DROP TABLE IF EXISTS _deletedstorages;
+
+            CREATE TEMPORARY TABLE _deletedstorages (
+                storage_id UUID,
+                storage_name TEXT,
+                backup_id UUID
+            );
+
+            FOR _id IN SELECT storage_id FROM _todelete
+                LOOP
+                    IF NOT EXISTS( SELECT id FROM "backup.model.oibs" WHERE storage_id = _id ) THEN
+                        RAISE NOTICE 'deleting storage %', _id;
+                        INSERT INTO _deletedstorages SELECT id as storage_id, file_path as storage_name, backup_id  FROM "backup.model.storages"  where id = _id;
+                        PERFORM "backup.model.deletestorage"(_id);
+                    END IF;
+
+                END LOOP;
+
+            FOR _id IN SELECT point_id FROM _todelete
+                LOOP
+                    IF NOT EXISTS( SELECT id FROM "backup.model.oibs" WHERE point_id = _id ) THEN
+                        RAISE NOTICE 'deleting point %', _id;
+
+                        PERFORM "backup.model.deletepoint"(_id);
+                    END IF;
+
+                END LOOP;
+
+            DROP TABLE IF EXISTS _tenantbackupstorages;
+
+            CREATE TEMP TABLE _tenantbackupstorages ON COMMIT DROP AS
+                SELECT t.id as tenant_id, b.id AS backup_id, ds.storage_id, t.name AS tenant_name, br.name as repo_name, ds.storage_name, b.job_name as backupname from "quotas.backup" qb join _deletedstorages ds
+                ON qb.backupId = ds.backup_id
+                JOIN "quotas.tenant" qt on qt.id = qb.id
+                JOIN  tenants t on t.id = qt.tenantId
+                JOIN  "backup.model.backups" b on ds.backup_id = b.id
+                JOIN  backuprepositories br on br.id = b.repository_id
+                ORDER BY br.name;
+
+            RAISE NOTICE '__________________________________';
+            RAISE NOTICE 'LIST OF DELETED STORAGES';
+
+           FOR _id IN SELECT storage_id FROM  _tenantbackupstorages order by tenant_id, repo_name, backup_id
+            LOOP
+
+                    RAISE NOTICE 'deleted storage: % backup: % tenant: % repository: %',
+                        (select storage_name from _tenantbackupstorages where storage_id = _id),
+                        (select backupname from _tenantbackupstorages where storage_id = _id),
+                        (select tenant_name from _tenantbackupstorages where storage_id = _id),
+                        (select repo_name from _tenantbackupstorages where storage_id = _id)
+                    ;
+
+            END LOOP;
+
+        END;
+
+    END;
+$$ LANGUAGE plpgsql;
+
+
+COMMIT;
+
+
+
+
+

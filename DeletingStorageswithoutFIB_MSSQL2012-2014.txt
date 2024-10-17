@@ -1,0 +1,160 @@
+set xact_abort on;
+BEGIN TRAN;
+
+declare @id uniqueidentifier;
+declare @backupid uniqueidentifier;
+DECLARE @Year int = 2024, @Month int = 8, @Day int = 26;
+
+SELECT DISTINCT bkp.id as backupId INTO  #toBackupCleanupAll FROM [Backup.Model.Storages] stg
+JOIN [Backup.Model.OIBs] oib ON oib.storage_id = stg.id
+JOIN [Backup.Model.Backups] bkp ON bkp.id = stg.backup_id
+WHERE oib.is_corrupted = 1 AND
+	stg.data_size = 0 AND
+	bkp.job_target_type IN (51, 63) AND
+	stg.creation_time > DATEFROMPARTS (@Year, @Month, @Day)
+
+
+
+CREATE TABLE #todeleteSuspects
+(
+	oib_id UNIQUEIDENTIFIER,
+	storage_id UNIQUEIDENTIFIER,
+	point_id UNIQUEIDENTIFIER, 
+	oib_is_corrupted BIT,
+	storage_data_size bigint
+);
+
+WITH all_corrupted_oibs AS 
+(
+	select s.id as storage_id, o.id as oib_id, p.id as point_id, s.file_path as storagename, o.object_id as bobject_id, s.creation_time as storage_creation_time,
+		o.is_corrupted as oib_is_corrupted, s.data_size as storage_data_size, s.backup_id as backup_id
+	from [Backup.Model.Storages] s
+	join [Backup.Model.OIBs] o on s.id = o.storage_id
+	join [Backup.Model.Points] p on p.id = o.point_id
+	join #toBackupCleanupAll cleanupall on cleanupall.backupId = p.backup_id
+	where s.creation_time > DATEFROMPARTS (@Year, @Month, @Day)
+),
+sorted_one_oibs_per_object as
+(
+	select all_corrupted_oibs.*,
+		row_number() over (partition by all_corrupted_oibs.backup_id, all_corrupted_oibs.bobject_id order by storage_creation_time desc) as rowNumber
+	from all_corrupted_oibs
+)
+INSERT INTO #todeleteSuspects SELECT oib_id, storage_id, point_id, oib_is_corrupted, storage_data_size FROM sorted_one_oibs_per_object
+WHERE rowNumber = 1;
+
+
+
+SELECT * INTO #todelete FROM #todeleteSuspects WHERE
+storage_data_size = 0 AND oib_is_corrupted = 1;
+
+DECLARE deleteost CURSOR FOR SELECT oib_id FROM #todelete;
+OPEN deleteost
+    FETCH NEXT FROM deleteost INTO @id;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+			PRINT [dbo].[System.FormatString]('deleting oib %s', @id);
+			exec [Backup.Model.DeleteOIB] @id;
+		FETCH NEXT FROM deleteost INTO @id;
+     END
+
+CLOSE deleteost;
+DEALLOCATE deleteost;
+
+
+
+
+CREATE TABLE #deletedstorages
+(
+	storage_id UNIQUEIDENTIFIER,
+	storagename nvarchar(1000),
+	backup_id UNIQUEIDENTIFIER 
+
+);
+
+
+
+DECLARE deleteost CURSOR FOR SELECT storage_id FROM #todelete;
+OPEN deleteost
+    FETCH NEXT FROM deleteost INTO @id;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+		IF NOT EXISTS( SELECT id FROM [Backup.Model.Oibs] WHERE storage_id = @id )
+		BEGIN
+			PRINT [dbo].[System.FormatString]( 'Storage id %s', @id);
+			INSERT INTO #deletedstorages SELECT id as storage_id, file_path as storagename, backup_id FROM [Backup.Model.Storages] where id = @id
+			exec [Backup.Model.DeleteStorage] @id;
+		END
+		FETCH NEXT FROM deleteost INTO @id;
+     END
+
+CLOSE deleteost;
+DEALLOCATE deleteost;
+
+DECLARE deleteost CURSOR FOR SELECT point_id FROM #todelete;
+OPEN deleteost
+    FETCH NEXT FROM deleteost INTO @id;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+		IF NOT EXISTS( SELECT id FROM [Backup.Model.Oibs] WHERE point_id = @id )
+		BEGIN
+			PRINT [dbo].[System.FormatString]('deleting point %s', @id );
+			exec [Backup.Model.DeletePoint] @id;
+		END
+		FETCH NEXT FROM deleteost INTO @id;
+     END
+
+CLOSE deleteost;
+DEALLOCATE deleteost;
+
+
+
+
+ select t.id as tenant_id, b.id as backup_id, ds.storage_id, t.name as tenant_name, br.name as repo_name, ds.storagename, b.job_name as backupname into #information from [Quotas.Backup] qb join #deletedstorages ds
+ on qb.backupId = ds.backup_id
+ join [Quotas.Tenant] qt on qt.id = qb.id  
+ join Tenants t on t.id = qt.tenantId
+ join [Backup.Model.Backups] b on ds.backup_id = b.id
+ join BackupRepositories br on br.id = b.repository_id
+ order by br.name
+
+
+  
+
+
+DECLARE info CURSOR FOR SELECT  storage_id FROM #information ;
+OPEN info
+	FETCH  NEXT FROM info INTO @id;
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+
+			declare @tenantname nvarchar(1000) = (select tenant_name from  #information where storage_id = @id);
+			
+			declare @backupname nvarchar(255) = (select  backupname from #information where storage_id = @id);						
+			
+			declare @reponame nvarchar(1000) = (select repo_name from  #information where storage_id = @id);
+
+			declare @storagename nvarchar(1000) = (select storagename from  #information  where  storage_id = @id);
+
+			PRINT [dbo].[System.FormatString4]('Storage name: %s Backup: %s Tenant: %s Repository: %s ', @storagename, @backupname, @tenantname, @reponame );
+
+
+		
+		FETCH NEXT FROM info INTO @id;
+	END
+
+CLOSE info;
+DEALLOCATE info;
+
+select * from  #information order by tenant_name, repo_name, backupname
+
+
+DROP TABLE #toBackupCleanupAll;
+DROP TABLE  #todeleteSuspects
+DROP TABLE  #todelete
+DROP TABLE  #deletedstorages
+DROP TABLE  #information
+
+
+
+COMMIT
